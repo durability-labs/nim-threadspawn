@@ -1,0 +1,6 @@
+nimcache/
+nimble.paths
+*.exe
+tests/testall
+nimble.develop
+nimbledeps
