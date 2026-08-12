@@ -8,7 +8,7 @@ import pkg/questionable/results
 
 import pkg/threadspawn
 
-import ./asynctest
+import pkg/asynctest/chronos/unittest2
 
 type ToyTask = object
   value: int
