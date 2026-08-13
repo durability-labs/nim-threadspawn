@@ -15,7 +15,7 @@
 ##    ``withThreadSignal`` handles signal create+destroy; ``awaitSpawn`` handles
 ##    the cancellation-safe join.
 ## 2. **Result transfer.** Workers write results into ``ctx[].result`` via
-##    ``unsafeIsolate(move result)`` and ``spawnJoin`` extracts it after
+##    ``isolate(move result)`` and ``spawnJoin`` extracts it after
 ##    awaiting.  ``TaskCtx[T]`` uses a ``SharedPtr`` so the ctx can be passed
 ##    to the worker by pointer and cleaned up via atomic refcounting.
 ##
@@ -108,7 +108,7 @@ type
     ## ``signal``: completion notification (fired by the worker via
     ## ``fireSync``).
     ## ``result``: output value wrapped in ``Isolated`` for thread-safe
-    ## transfer.  Workers must assign with ``unsafeIsolate(move result)`` to
+    ## transfer.  Workers must assign with ``isolate(move result)`` to
     ## move the result rather than copy it.
     ##
     ## Memory management: use ``SharedPtr[TaskCtx[T]]`` so atomic refcounting
@@ -356,7 +356,7 @@ proc spawnJoin*[T](
   ## ``tp.spawn worker(ctx, ...)``).  The callback runs on the calling thread
   ## before the first await, so any backend that can run a proc and fire a
   ## ``ThreadSignalPtr`` works.  Workers write results with:
-  ## ``ctx[].result = unsafeIsolate(move result)``
+  ## ``ctx[].result = isolate(move result)``
   ##
   ## ``onError`` is invoked if the await fails or is cancelled, before the
   ## noCancel drain (use it to flip ``finished`` flags etc).
