@@ -15,57 +15,9 @@ type ToyTask = object
   ok: Atomic[bool]
   signal: ThreadSignalPtr
 
-# Walker coverage: shapes the containsGCRef walker must classify correctly.
-# Direct calls exercise the typeDesc-unwrap path (which used to return false
-# for every named type).
-type
-  AcyclicBlock {.acyclic.} = ref object of RootObj
-    cid: int
-    data: seq[byte]
-
-  AcyclicHolder = object
-    blk: AcyclicBlock
-
-  AcyclicWithRef {.acyclic.} = ref object of RootObj
-    inner: ref int
-
-  VariantWithRef = object
-    case k: bool
-    of true:
-      r: ref int
-    of false:
-      i: int
-
-  BaseWithRef = object of RootObj
-    r: ref int
-
-  ChildWithRef = object of BaseWithRef
-    y: int
-
-static:
-  # forbidden: cycle-tracked refs, closures, and refs hidden in containers
-  doAssert containsGCRef(ref int)
-  doAssert containsGCRef(seq[ref int])
-  doAssert containsGCRef(Option[ref int])
-  doAssert containsGCRef(tuple[a: int, b: ref int])
-  doAssert containsGCRef((int, ref int))
-  doAssert containsGCRef(proc(x: int))
-  doAssert containsGCRef(proc(x: int) {.closure.})
-  # forbidden: variant branches and inherited base fields
-  doAssert containsGCRef(VariantWithRef)
-  doAssert containsGCRef(ChildWithRef)
-  # forbidden: acyclic annotation does not excuse nested cycle-tracked refs
-  doAssert containsGCRef(AcyclicWithRef)
-  # allowed: values, raw pointers, function pointers
-  doAssert not containsGCRef(int)
-  doAssert not containsGCRef(seq[byte])
-  doAssert not containsGCRef(ptr int)
-  doAssert not containsGCRef(pointer)
-  doAssert not containsGCRef(proc(x: int) {.nimcall.})
-  # allowed: acyclic refs, including as object fields (field-name syms must
-  # not be walked as types - regression guard)
-  doAssert not containsGCRef(AcyclicBlock)
-  doAssert not containsGCRef(AcyclicHolder)
+type AcyclicBlock {.acyclic.} = ref object of RootObj
+  cid: int
+  data: seq[byte]
 
 proc toyWorker(task: ptr ToyTask) {.gcsafe.} =
   task[].ok.store(true)
@@ -172,11 +124,13 @@ suite "threadspawn wrappers":
     # {.acyclic.} refs are never entered in ORC's per-thread cycle registry,
     # so a worker-created ref crosses safely under unique ownership: the
     # worker writes the result and never touches the payload again.  The
-    # safe `isolate` rejects ref payloads, so this site stays `unsafeIsolate`.
+    # inline construction lets the safe `isolate` prove the payload is
+    # unshared; moving a direct ref payload out of a variable would be
+    # rejected (the variable could be read again).
     proc runAcycTask(ctx: SharedPtr[TaskCtx[AcyclicBlock]]) {.gcsafe.} =
-      var r =
+      ctx[].result = isolate(
         ThreadSpawnRes[AcyclicBlock].ok(AcyclicBlock(cid: 7, data: @[1'u8, 2'u8, 3'u8]))
-      ctx[].result = unsafeIsolate(move r)
+      )
       discard ctx[].signal.fireSync()
 
     proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =

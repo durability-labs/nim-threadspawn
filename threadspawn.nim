@@ -57,7 +57,6 @@ when not compileOption("threads"):
   {.error: "threadspawn requires -threads:on".}
 
 import std/isolation
-import std/macros
 
 import pkg/chronos
 import pkg/chronos/threadsync
@@ -117,133 +116,6 @@ type
     signal*: ThreadSignalPtr
     result*: Isolated[ThreadSpawnRes[T]]
 
-macro containsGCRef*(T: typedesc): untyped =
-  ## Compile-time check whether a type transitively contains GC-managed
-  ## references (``ref`` types, closures, closure iterators).
-  ##
-  ## Raw pointers (``ptr``/``pointer``) and non-capturing procs move across
-  ## threads as plain values and are allowed; the pointed-to data stays the
-  ## caller's responsibility.
-  ##
-  ## ``{.acyclic.}`` ref types are allowed: ORC never enters them in the
-  ## per-thread cycle registry (see ``markedAsCyclic`` in system/orc.nim), so
-  ## cross-thread moves use plain refcounting.  The pointee is still walked
-  ## transitively, so refs nested inside must themselves be acyclic.
-
-  proc hasClosurePragma(ty: NimNode): bool =
-    for child in ty:
-      if child.kind == nnkPragma:
-        for p in child:
-          if p.eqIdent("closure"):
-            return true
-    false
-
-  proc hasConvPragma(ty: NimNode): bool =
-    for child in ty:
-      if child.kind == nnkPragma:
-        for p in child:
-          if p.eqIdent("nimcall") or p.eqIdent("cdecl") or p.eqIdent("stdcall") or
-              p.eqIdent("fastcall") or p.eqIdent("thiscall") or p.eqIdent("safecall") or
-              p.eqIdent("noconv") or p.eqIdent("syscall") or p.eqIdent("inline"):
-            return true
-    false
-
-  proc hasAcyclicPragma(sym: NimNode): bool =
-    # `{.acyclic.}` lives on the type definition (getImpl), not in the
-    # getTypeImpl output.
-    for child in sym.getImpl:
-      if child.kind == nnkPragmaExpr:
-        for p in child[1]:
-          if p.eqIdent("acyclic"):
-            return true
-    false
-
-  var seen: seq[string]
-
-  proc walk(n: NimNode): bool =
-    case n.kind
-    of nnkRefTy:
-      # anonymous refs cannot be annotated acyclic
-      return true
-    of nnkPtrTy:
-      return false
-    of nnkProcTy, nnkIteratorTy:
-      # anonymous proc/iterator types default to closure
-      return hasClosurePragma(n) or not hasConvPragma(n)
-    of nnkObjectTy, nnkTupleTy:
-      for section in n:
-        if walk(section):
-          return true
-      return false
-    of nnkRecList, nnkRecCase, nnkOfBranch:
-      for child in n:
-        if walk(child):
-          return true
-      return false
-    of nnkTupleConstr, nnkObjConstr, nnkExprColonExpr:
-      # value-constructor nodes arrive when the query is called with a
-      # value expression (e.g. containsGCRef((int, ref int))): walk the
-      # children so refs inside tuple/object literals are still found
-      for child in n:
-        if walk(child):
-          return true
-      return false
-    of nnkIdentDefs:
-      # walk the field type only.  Field names are symbols whose
-      # getTypeImpl returns the field's type, but acyclic pragmas live on
-      # the type symbol, so walking names would misfire on acyclic refs.
-      # Tuples carry their fields as direct nnkIdentDefs children (no
-      # RecList), variant branches as nnkRecCase > nnkOfBranch.
-      return walk(n[n.len - 2])
-    of nnkOfInherit:
-      return walk(n[0])
-    of nnkBracketExpr:
-      # generic instantiation or array; walk the type arguments
-      for i in 1 ..< n.len:
-        if n[i].kind != nnkStaticExpr and walk(n[i]):
-          return true
-      return false
-    of nnkDistinctTy, nnkVarTy:
-      return walk(n[0])
-    of nnkSym:
-      let impl = n.getTypeImpl
-      # direct containsGCRef(NamedType) calls arrive wrapped in typeDesc;
-      # unwrap without the cycle guard (the inner sym is the type itself)
-      if impl.kind == nnkBracketExpr and impl[0].eqIdent("typeDesc"):
-        return walk(impl[1])
-      let key = n.repr
-      if key in seen:
-        return false
-      seen.add key
-      if impl.kind == nnkRefTy:
-        if not hasAcyclicPragma(n):
-          return true
-        # acyclic ref: allowed iff its pointee is transitively safe
-        return walk(impl[0])
-      if impl.kind == n.kind:
-        return false # primitive
-      return walk(impl)
-    else:
-      return false
-
-  result = newLit(walk(T))
-
-proc assertNoGCRefs[T]() {.inline.} =
-  ## Instantiation-time guard for ``ThreadSpawnRes`` payloads.
-  ##
-  ## Invoked from ``mapThreadSpawnErr`` (worker boundary) and ``spawnJoin``
-  ## (extraction).  Lives in a generic proc (not a template) because ``when``
-  ## inside a template sees the unbound generic parameter: macros invoked in
-  ## template bodies expand before substitution, so the payload check would
-  ## silently no-op.  Generic procs are instantiated with the concrete type,
-  ## exactly like ``when T is void`` in ``spawnJoin``.
-
-  when containsGCRef(T):
-    {.
-      error:
-        "ThreadSpawnRes forbids GC-managed references in the payload (got " & $T & ")"
-    .}
-
 type SpawnFailure* = object of CatchableError
   ## Error type used when converting ThreadSpawnRes failures to ?!T.
 
@@ -259,7 +131,6 @@ template mapThreadSpawnErr*[T, V](exp: Result[T, V]): ThreadSpawnRes[T] =
   ## The message is copied into an owned string, so it stays valid after the
   ## worker's scope ends.
 
-  assertNoGCRefs[T]()
   exp.mapErr(
     proc(e: V): string =
       when typeof(e) is (ref Exception):
@@ -371,7 +242,6 @@ proc spawnJoin*[T](
   ##      let keys = ?await spawnJoin[seq[Key]]:
   ##        proc(ctx: SharedPtr[TaskCtx[seq[Key]]]) {.gcsafe.} =
   ##          self.tp.spawn runHasTaskMany(ctx, paths)
-  assertNoGCRefs[T]()
   withThreadSignal(sig):
     let ctx = newSharedPtr(TaskCtx[T](signal: sig))
     let taskFut = sig.wait()

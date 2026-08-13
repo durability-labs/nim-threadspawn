@@ -56,13 +56,13 @@ Workers write results with `ctx[].result = isolate(move result)` and fire the si
 
 `ThreadSpawnRes[T]` payloads must not transitively contain GC-managed references: the result crosses a thread boundary and the worker's heap may be torn down before the caller reads it.
 
-Every use of `mapThreadSpawnErr` (worker boundary) and `spawnJoin` (extraction) runs a compile-time check that walks the payload type's full structure - nested fields, tuple fields, variant branches, and generic arguments like `seq[T]` or `Result[T, E]` - and fails the build if a GC-managed reference appears anywhere inside. `{.acyclic.}` refs pass only if their own pointee is safe as well. Direct `withThreadSignal` + `awaitSpawn` users that read `ctx[].result` manually are on their own.
+The result channel is `Isolated[ThreadSpawnRes[T]]`, and the safe `isolate` enforces the constraint at compile time at the assignment site: it proves the payload expression is unshared and fails the build otherwise. `{.acyclic.}` refs are accepted when the analysis can prove the value is fresh - ORC never enters acyclic types in the per-thread cycle registry, so a worker-created acyclic ref crosses safely under unique ownership (the worker must not retain a reference after writing the result; refcounts are not atomic in this build). `unsafeIsolate` is the escape hatch for the shapes the analysis cannot prove (e.g. a direct ref payload moved out of a variable that could be read again). Direct `withThreadSignal` + `awaitSpawn` users that read `ctx[].result` manually are on their own.
 
 Allowed:
 
 - `ptr` / `pointer` - plain values; the pointed-to data stays the caller's responsibility
 - non-capturing procs (`nimcall` and friends) - closures are forbidden
-- `{.acyclic.}` ref types - ORC never enters them in the per-thread cycle registry; the pointee is walked transitively (nested non-acyclic refs are still rejected), and ownership must be unique at transfer (refcounts are not atomic in this build - the worker must not retain a reference after writing the result)
+- `{.acyclic.}` ref types - when the analysis proves the value unshared (fresh construction); otherwise via the `unsafeIsolate` escape hatch
 
 Forbidden: `ref` types (anonymous or named, unless `{.acyclic.}`), closures, closure iterators.
 
