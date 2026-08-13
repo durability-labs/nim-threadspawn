@@ -1,6 +1,12 @@
-nimcache/
-nimble.paths
-*.exe
-tests/testall
+*
+!*.*
+!*/
+coverage
+nimcache
 nimble.develop
+nimble.paths
+nim.cfg
 nimbledeps
+.vscode/*
+*.dSYM
+*.exe
