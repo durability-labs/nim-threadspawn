@@ -1,6 +1,6 @@
 # threadspawn
 
-Cancellation-safe primitives for bridging taskpools thread spawn to Chronos async. Requires `-threads:on` (a compile-time error is raised otherwise).
+Cancellation-safe primitives for bridging taskpools thread spawn to Chronos async. Requires `-threads:on`.
 
 ## What it solves
 
@@ -54,7 +54,9 @@ Workers write results with `ctx[].result = isolate(move result)` and fire the si
 
 ## The GC-ref constraint
 
-`ThreadSpawnRes[T]` payloads must not transitively contain GC-managed references: the result crosses a thread boundary and the worker's heap may be torn down before the caller reads it. Enforced at compile time by `assertNoGCRefs[T]()` (backed by the `containsGCRef` AST walker), invoked from both `mapThreadSpawnErr` (worker boundary) and `spawnJoin` (extraction). Direct `withThreadSignal` + `awaitSpawn` users that read `ctx[].result` manually are on their own.
+`ThreadSpawnRes[T]` payloads must not transitively contain GC-managed references: the result crosses a thread boundary and the worker's heap may be torn down before the caller reads it.
+
+Every use of `mapThreadSpawnErr` (worker boundary) and `spawnJoin` (extraction) runs a compile-time check that walks the payload type's full structure - nested fields, tuple fields, variant branches, and generic arguments like `seq[T]` or `Result[T, E]` - and fails the build if a GC-managed reference appears anywhere inside. `{.acyclic.}` refs pass only if their own pointee is safe as well. Direct `withThreadSignal` + `awaitSpawn` users that read `ctx[].result` manually are on their own.
 
 Allowed:
 
