@@ -118,7 +118,7 @@ suite "threadspawn wrappers":
   test "spawnJoin extracts generic result":
     proc runIntTask(ctx: SharedPtr[TaskCtx[int]]) {.gcsafe.} =
       var r = ThreadSpawnRes[int].ok(123)
-      ctx[].result = unsafeIsolate(move r)
+      ctx[].result = isolate(move r)
       discard ctx[].signal.fireSync()
 
     proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
@@ -131,7 +131,7 @@ suite "threadspawn wrappers":
   test "spawnJoin with void result":
     proc runVoidTask(ctx: SharedPtr[TaskCtx[void]]) {.gcsafe.} =
       var r = ThreadSpawnRes[void].ok()
-      ctx[].result = unsafeIsolate(move r)
+      ctx[].result = isolate(move r)
       discard ctx[].signal.fireSync()
 
     proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
@@ -144,7 +144,7 @@ suite "threadspawn wrappers":
   test "spawnJoin extracts error result":
     proc runErrTask(ctx: SharedPtr[TaskCtx[int]]) {.gcsafe.} =
       var r = ThreadSpawnRes[int].err("boom")
-      ctx[].result = unsafeIsolate(move r)
+      ctx[].result = isolate(move r)
       discard ctx[].signal.fireSync()
 
     proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
@@ -158,7 +158,7 @@ suite "threadspawn wrappers":
   test "spawnJoin with seq result (move, not copy)":
     proc runSeqTask(ctx: SharedPtr[TaskCtx[seq[int]]]) {.gcsafe.} =
       var r = ThreadSpawnRes[seq[int]].ok(@[1, 2, 3, 4, 5])
-      ctx[].result = unsafeIsolate(move r)
+      ctx[].result = isolate(move r)
       discard ctx[].signal.fireSync()
 
     proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
@@ -171,7 +171,8 @@ suite "threadspawn wrappers":
   test "spawnJoin moves an acyclic ref payload":
     # {.acyclic.} refs are never entered in ORC's per-thread cycle registry,
     # so a worker-created ref crosses safely under unique ownership: the
-    # worker writes the result and never touches the payload again.
+    # worker writes the result and never touches the payload again.  The
+    # safe `isolate` rejects ref payloads, so this site stays `unsafeIsolate`.
     proc runAcycTask(ctx: SharedPtr[TaskCtx[AcyclicBlock]]) {.gcsafe.} =
       var r =
         ThreadSpawnRes[AcyclicBlock].ok(AcyclicBlock(cid: 7, data: @[1'u8, 2'u8, 3'u8]))
