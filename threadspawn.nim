@@ -42,9 +42,14 @@
 ## ``ThreadSignalPtr`` works.  Only ``awaitSpawn`` uses chronos internals
 ## (``join`` / ``noCancel``), which are backend-independent.
 ##
-## Multi-spawn note: ``spawnJoin`` covers the single-spawn-then-await
-## majority.  For parallel loops (e.g. kvstore ``getImpl`` chunked reads), use
-## ``withThreadSignal`` per spawn, collect futures, and ``awaitSpawn`` each.
+## Multi-spawn note: ``spawnJoin`` covers both the single-spawn-then-await
+## majority and parallel loops - spawn once per item and await each (e.g.
+## kvstore ``getImpl`` chunked reads).  Each ``spawnJoin`` owns its signal
+## lifecycle across its own suspension.  Do NOT share one ``withThreadSignal``
+## block across spawns whose awaits outlive the block: its block-scoped
+## ``defer: signal.close()`` closes the fd while a worker still holds it.
+## For long-lived per-task signals (archivist asyncbuilder's batch pattern),
+## own the signal in the task context and close it after the awaited join.
 
 {.push raises: [].}
 
