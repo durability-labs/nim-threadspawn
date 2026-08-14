@@ -64,7 +64,7 @@ import pkg/chronicles
 import pkg/questionable/results
 import pkg/threading/smartptrs
 
-export isolation
+export isolation except unsafeIsolate
 export threadsync
 export smartptrs
 
