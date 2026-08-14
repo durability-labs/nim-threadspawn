@@ -1,0 +1,54 @@
+name: Tests
+on: [push, pull_request]
+
+jobs:
+  formatting:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check nph formatting
+        uses: arnetheduck/nph-action@v1
+        with:
+          version: 0.6.1
+          options: "threadspawn.nim tests/"
+          fail: true
+          suggest: false
+
+  test:
+    strategy:
+      matrix:
+        platform:
+          - {
+            icon: 🐧,
+            label: Linux,
+            os: ubuntu,
+            shell: bash --noprofile --norc -eo pipefail
+          }
+          - {
+            icon: 🍎,
+            label: macOS,
+            os: macos,
+            shell: bash --noprofile --norc -eo pipefail
+          }
+          - {
+            icon: 🏁,
+            label: Windows,
+            os: windows,
+            shell: msys2
+          }
+        nim: [binary:2.2.6]
+    name: ${{ matrix.platform.icon }} ${{ matrix.platform.label }} - Nim v${{ matrix.nim }}
+    runs-on: ${{ matrix.platform.os }}-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: true
+    - uses: iffy/install-nim@v5
+      with:
+        version: ${{ matrix.nim }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Build
+      run: nimble install -y
+    - name: Test
+      run: nimble test -y
