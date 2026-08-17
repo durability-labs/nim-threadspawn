@@ -15,9 +15,10 @@
 ##    ``withThreadSignal`` handles signal create+destroy; ``awaitSpawn`` handles
 ##    the cancellation-safe join.
 ## 2. **Result transfer.** Workers write results into ``ctx[].result`` via
-##    ``isolate(move result)`` and ``spawnJoin`` extracts it after
-##    awaiting.  ``TaskCtx[T]`` uses a ``SharedPtr`` so the ctx can be passed
-##    to the worker by pointer and cleaned up via atomic refcounting.
+##    the ``ThreadSpawnRes`` constructors (``ThreadSpawnRes[T].ok(...)``)
+##    and ``spawnJoin`` extracts after awaiting.  ``TaskCtx[T, E]`` uses a
+##    ``SharedPtr`` so the ctx can be passed to the worker by pointer and
+##    cleaned up via atomic refcounting.
 ##
 ## Usage by pattern:
 ##
@@ -33,7 +34,7 @@
 ## **Generic result** (kvstore-style):
 ##
 ##   .. code-block:: nim
-##      let value = ?await spawnJoin[MyResultType]:
+##      let value = ?await spawnJoin:
 ##        proc(ctx: SharedPtr[TaskCtx[MyResultType]]) {.gcsafe.} =
 ##          tp.spawn myWorker(ctx, args)
 ##
@@ -63,6 +64,7 @@ import pkg/chronos/threadsync
 import pkg/chronicles
 import pkg/questionable/results
 import pkg/threading/smartptrs
+from pkg/results import ok, err
 
 export isolation except unsafeIsolate
 export threadsync
@@ -83,55 +85,61 @@ type
     ## Must not raise - a cancelled cleanup callback would hit Chronos'
     ## ``noCancel`` ``raiseAssert`` and convert a cancellation into a Defect.
 
-  ThreadSpawnRes*[T] = Result[T, string]
-    ## Thread safe result type
+  ThreadSpawnRes*[T, E = string] = Isolated[Result[T, E]]
+    ## Thread safe result type. Values are move-only (`=copy` is an error on
+    ## Isolated) and consumed exactly once via `extract`. Construction through
+    ## `ok`/`err` runs the compiler's `Isolate` check: T and E must not be
+    ## references, closures, or contain them in object fields, arrays, or
+    ## tuples. Refs nested inside seqs are not visible to that analysis and
+    ## must be `{.acyclic.}` (never entered in ORC's per-thread cycle
+    ## registry); `ptr`/`pointer` and `{.nimcall.}` procs are plain values.
     ##
-    ## The error is an owned string so the message stays valid after the
-    ## worker's scope ends.
-    ##
-    ## The payload must not transitively contain GC-managed references
-    ## (``ref``, closures, closure iterators): the result crosses a thread
-    ## boundary and the worker's heap may be torn down before the caller
-    ## reads it.  Raw pointers (``ptr``/``pointer``) and non-capturing procs
-    ## are plain values and are allowed.  ``{.acyclic.}`` ref types are
-    ## allowed too (never entered in the per-thread cycle registry), but only
-    ## under unique ownership at transfer: the worker must not retain a
-    ## reference to the payload after writing the result (refcounts are not
-    ## atomic in this build).  ``mapThreadSpawnErr`` and ``spawnJoin``
-    ## enforce this at compile time; callers that read ``ctx[].result``
-    ## directly (``withThreadSignal`` + ``awaitSpawn``) are on their own.
+    ## Workers write `ctx[].result = ThreadSpawnRes[T].ok(...)`; the caller
+    ## extracts with `extract(ctx[].result)`.
 
-  TaskCtx*[T] = object
+  TaskCtx*[T, E = string] = object
     ## Per-task state for cross-thread communication with generic results.
     ##
     ## ``signal``: completion notification (fired by the worker via
     ## ``fireSync``).
-    ## ``result``: output value wrapped in ``Isolated`` for thread-safe
-    ## transfer.  Workers must assign with ``isolate(move result)`` to
-    ## move the result rather than copy it.
+    ## ``result``: output value wrapped in ``ThreadSpawnRes``, which is
+    ## `Isolated[Result[T, E]]` - workers must construct it via the `ok`/`err`
+    ## constructors, which run the `Isolate` payload check.
     ##
-    ## Memory management: use ``SharedPtr[TaskCtx[T]]`` so atomic refcounting
+    ## Memory management: use ``SharedPtr[TaskCtx[T, E]]`` so atomic refcounting
     ## handles cleanup.  The ``SharedPtr`` passes through ``toTask``'s
     ## ``isolate`` as a single pointer move.
     signal*: ThreadSignalPtr
-    result*: Isolated[ThreadSpawnRes[T]]
+    result*: ThreadSpawnRes[T, E]
+
+proc ok*[T, E](R: type ThreadSpawnRes[T, E], value: sink T): R =
+  ## Wrap a worker success value. Runs the `Isolate` payload check.
+  isolate(Result[T, E].ok(move value))
+
+proc ok*[E](R: type ThreadSpawnRes[void, E]): R =
+  ## Wrap a worker success for a void task.
+  isolate(Result[void, E].ok())
+
+proc err*[T, E](R: type ThreadSpawnRes[T, E], error: sink E): R =
+  ## Wrap a worker failure. Runs the `Isolate` payload check on E.
+  isolate(Result[T, E].err(move error))
+
+proc err*[E](R: type ThreadSpawnRes[void, E], error: sink E): R =
+  ## Wrap a worker failure for a void task.
+  isolate(Result[void, E].err(move error))
 
 type SpawnFailure* = object of CatchableError
   ## Error type used when converting ThreadSpawnRes failures to ?!T.
 
-template mapSpawnFailure*[T](res: ThreadSpawnRes[T]): Result[T, ref CatchableError] =
-  res.mapErr(
-    proc(e: string): ref CatchableError =
-      newException(SpawnFailure, e)
-  )
-
-template mapThreadSpawnErr*[T, V](exp: Result[T, V]): ThreadSpawnRes[T] =
-  ## Convert `Result[T, E]` to `Result[T, string]`.
+template mapThreadSpawnErr*[T, V](exp: Result[T, V]): ThreadSpawnRes[T, string] =
+  ## Convert `Result[T, E]` to `ThreadSpawnRes[T, string]` at the worker
+  ## boundary.
   ##
   ## The message is copied into an owned string, so it stays valid after the
-  ## worker's scope ends.
+  ## worker's scope ends. The result is isolated here, so callers must not
+  ## wrap it again.
 
-  exp.mapErr(
+  isolate exp.mapErr(
     proc(e: V): string =
       when typeof(e) is (ref Exception):
         e.msg
@@ -204,33 +212,47 @@ template withThreadSignal*(signalName, body: untyped) =
   ## so the signal fd is never leaked - even on cancellation.
   ##
   block:
-    let signalName {.inject.} = ?ThreadSignalPtr.new().mapSpawnFailure
+    let signalName {.inject.} =
+      ?ThreadSignalPtr.new().mapErr(
+        proc(e: string): ref CatchableError =
+          newException(SpawnFailure, e)
+      )
     defer:
       if closeErr =? signalName.close().errorOption:
         warn "Failed to close thread signal", error = closeErr
     body
 
-type SpawnFn*[T] = proc(ctx: SharedPtr[TaskCtx[T]]) {.gcsafe, raises: [].}
+type SpawnFn*[T, E = string] =
+  proc(ctx: SharedPtr[TaskCtx[T, E]]) {.gcsafe, raises: [].}
   ## Callback that receives the ctx and spawns the worker.
   ## Must call ``tp.spawn worker(ctx, ...)`` inside.
   ##
   ## ``raises: []`` prevents a callback exception from unwinding ``spawnJoin``'s
   ## signal-close defer while the queued worker still holds the signal.
 
-proc spawnJoin*[T](
-    spawnFn: SpawnFn[T], onError: OnSpawnError = nil
+proc spawnJoin*[T, E](
+    spawnFn: SpawnFn[T, E],
+    onError: OnSpawnError = nil,
+    errMap: proc(e: E): ref CatchableError {.gcsafe, raises: [].} = nil,
 ): Future[?!T] {.async: (raises: [CancelledError]).} =
-  ## Create a ``ThreadSignalPtr`` + ``SharedPtr[TaskCtx[T]]``, spawn the worker,
+  ## Create a ``ThreadSignalPtr`` + ``SharedPtr[TaskCtx[T, E]]``, spawn the worker,
   ## await completion, close the signal, and extract the result.
   ##
   ## ``spawnFn`` receives the ctx and must spawn the worker (e.g.
   ## ``tp.spawn worker(ctx, ...)``).  The callback runs on the calling thread
   ## before the first await, so any backend that can run a proc and fire a
   ## ``ThreadSignalPtr`` works.  Workers write results with:
-  ## ``ctx[].result = isolate(move result)``
+  ## ``ctx[].result = ThreadSpawnRes[T].ok(...)``
   ##
   ## ``onError`` is invoked if the await fails or is cancelled, before the
   ## noCancel drain (use it to flip ``finished`` flags etc).
+  ##
+  ## ``errMap`` converts the worker's typed error E to the ``?!T`` error type;
+  ## when nil, failures map to ``SpawnFailure`` via ``$e``.
+  ##
+  ## ``E`` is inferred from the worker's ctx type (e.g. ``TaskCtx[seq[Key]]``
+  ## infers ``E = string``); for a typed error, pass it explicitly:
+  ## ``spawnJoin[T, MyErr](...)``.
   ##
   ## Signal lifecycle (create/close) is fully encapsulated - the caller never
   ## touches ``ThreadSignalPtr``.  The defer runs on ALL exit paths, so the
@@ -239,18 +261,28 @@ proc spawnJoin*[T](
   ## Example:
   ##
   ##   .. code-block:: nim
-  ##      let keys = ?await spawnJoin[seq[Key]]:
+  ##      let keys = ?await spawnJoin:
   ##        proc(ctx: SharedPtr[TaskCtx[seq[Key]]]) {.gcsafe.} =
   ##          self.tp.spawn runHasTaskMany(ctx, paths)
+
+  let mapper =
+    if errMap.isNil:
+      (
+        proc(e: E): ref CatchableError {.gcsafe, raises: [].} =
+          newException(SpawnFailure, $e)
+      )
+    else:
+      errMap
+
   withThreadSignal(sig):
-    let ctx = newSharedPtr(TaskCtx[T](signal: sig))
+    let ctx = newSharedPtr(TaskCtx[T, E](signal: sig))
     let taskFut = sig.wait()
     if taskFut.failed():
       return failure(taskFut.error())
     spawnFn(ctx)
     ?await awaitSpawn(taskFut, onError)
     when T is void:
-      ?extract(ctx[].result).mapSpawnFailure
+      ?extract(ctx[].result).mapErr(mapper)
       success()
     else:
-      success ?extract(ctx[].result).mapSpawnFailure
+      success ?extract(ctx[].result).mapErr(mapper)

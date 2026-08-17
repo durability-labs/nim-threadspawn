@@ -7,7 +7,7 @@ Cancellation-safe primitives for bridging taskpools thread spawn to Chronos asyn
 Two pain points at the spawn/await boundary:
 
 1. **Signal lifecycle boilerplate.** Every call site repeats the `ThreadSignalPtr.new` / close / wait / cancellation-safe-join dance. `withThreadSignal` handles signal create + defer-close; `awaitSpawn` handles the cancellation-safe join.
-2. **Result transfer.** Workers write results into `ctx[].result` via `isolate(move result)`; `spawnJoin` extracts after awaiting. `TaskCtx[T]` is passed by `SharedPtr`, cleaned up via atomic refcounting.
+2. **Result transfer.** Workers write results into `ctx[].result` via the `ThreadSpawnRes` constructors (`ok`/`err`); `spawnJoin` extracts after awaiting. `TaskCtx[T, E]` is passed by `SharedPtr`, cleaned up via atomic refcounting.
 
 ## Three composable layers
 
@@ -27,44 +27,48 @@ template withThreadSignal*(signalName, body: untyped)
 
 Creates a `ThreadSignalPtr`, injects it as `signalName` (caller-chosen, no identifier collisions), and runs `body` in a block with `signal.close` deferred - on all exit paths, including exceptions and cancellation. Close errors are warn-only (the signal is being destroyed).
 
-### `spawnJoin[T]` - full pattern, one call
+### `spawnJoin[T, E]` - full pattern, one call
 
 ```nim
-proc spawnJoin*[T](spawnFn: SpawnFn[T], onError: OnSpawnError = nil): Future[?!T]
+proc spawnJoin*[T, E](
+    spawnFn: SpawnFn[T, E],
+    onError: OnSpawnError = nil,
+    errMap: proc(e: E): ref CatchableError {.gcsafe, raises: [].} = nil,
+): Future[?!T]
 
-type SpawnFn*[T] = proc(ctx: SharedPtr[TaskCtx[T]]) {.gcsafe, raises: [].}
+type SpawnFn*[T, E = string] = proc(ctx: SharedPtr[TaskCtx[T, E]]) {.gcsafe, raises: [].}
 ```
 
-Encapsulates signal create/close, `SharedPtr[TaskCtx[T]]`, worker spawn, cancellation-safe await, and result extraction. The spawn callback must be `raises: []` (an exception after enqueuing would unwind the signal-close defer while the queued worker still holds the signal). Takes a spawn callback, not a `Taskpool`, so any backend that can run a proc and fire a `ThreadSignalPtr` works.
+Encapsulates signal create/close, `SharedPtr[TaskCtx[T, E]]`, worker spawn, cancellation-safe await, and result extraction. The spawn callback must be `raises: []` (an exception after enqueuing would unwind the signal-close defer while the queued worker still holds the signal). Takes a spawn callback, not a `Taskpool`, so any backend that can run a proc and fire a `ThreadSignalPtr` works. `errMap` converts the worker's typed error `E` to the `?!T` error type; when nil, failures map to `SpawnFailure` via `$e`. `E` is inferred from the worker's ctx type (`TaskCtx[seq[Key]]` infers `E = string`); for a typed error, pass both explicitly: `spawnJoin[T, MyErr](...)`.
 
 ```nim
-let value = ?await spawnJoin[seq[Key]]:
+let value = ?await spawnJoin:
   proc(ctx: SharedPtr[TaskCtx[seq[Key]]]) {.gcsafe, raises: [].} =
     tp.spawn runHasTaskMany(ctx, paths)
 ```
 
-Workers write results with `ctx[].result = isolate(move result)` and fire the signal. For parallel loops, use `withThreadSignal` per spawn, collect the futures, and `awaitSpawn` each.
+Workers write results with `ctx[].result = ThreadSpawnRes[T].ok(...)` and fire the signal. For parallel loops, use `withThreadSignal` per spawn, collect the futures, and `awaitSpawn` each.
 
 ## Result channel
 
-- `ThreadSpawnRes*[T] = Result[T, string]` - the error is an owned string so the message stays valid after the worker's scope ends.
-- `TaskCtx*[T]` - `signal` (`ThreadSignalPtr`) + `result` (`Isolated[ThreadSpawnRes[T]]`).
-- `mapThreadSpawnErr*[T, V](exp: Result[T, V]): ThreadSpawnRes[T]` - converts typed results at the worker boundary (message copied into an owned string).
-- `mapSpawnFailure*[T](res): Result[T, ref CatchableError]` - converts thread results to `?!T` at the async boundary, wrapping failures in `SpawnFailure`.
+- `ThreadSpawnRes*[T, E = string] = Isolated[Result[T, E]]` - move-only; the payload and error are checked by the compiler's `Isolate` mechanism at construction.
+- `TaskCtx*[T, E = string]` - `signal` (`ThreadSignalPtr`) + `result` (`ThreadSpawnRes[T, E]`).
+- `mapThreadSpawnErr*[T, V](exp: Result[T, V]): ThreadSpawnRes[T, string]` - converts typed results at the worker boundary, isolating the result (message copied into an owned string).
+- `spawnJoin`'s `errMap` converts thread results to `?!T` at the async boundary; the default wraps failures in `SpawnFailure`.
 
 ## The GC-ref constraint
 
-`ThreadSpawnRes[T]` payloads must not transitively contain GC-managed references: the result crosses a thread boundary and the worker's heap may be torn down before the caller reads it.
+`ThreadSpawnRes[T, E]` payloads and errors must not transitively contain non-acyclic GC-managed references: the result crosses a thread boundary and the worker's heap may be torn down before the caller reads it.
 
-The result channel is `Isolated[ThreadSpawnRes[T]]`, and the safe `isolate` enforces the constraint at compile time at the assignment site: it proves the payload expression is unshared and fails the build otherwise. `{.acyclic.}` refs are accepted when the analysis can prove the value is fresh - ORC never enters acyclic types in the per-thread cycle registry, so a worker-created acyclic ref crosses safely under unique ownership (the worker must not retain a reference after writing the result; refcounts are not atomic in this build). `unsafeIsolate` is the escape hatch for the shapes the analysis cannot prove (e.g. a direct ref payload moved out of a variable that could be read again). Direct `withThreadSignal` + `awaitSpawn` users that read `ctx[].result` manually are on their own.
+The result type is `Isolated[Result[T, E]]`, and construction through the `ok`/`err` constructors runs the compiler's `Isolate` check at the assignment site: it proves the payload expression is unshared and fails the build otherwise. The check cannot see through sequences: refs nested inside seqs pass and must be `{.acyclic.}` - ORC never enters acyclic types in the per-thread cycle registry, so a worker-created acyclic ref crosses safely under unique ownership (the worker must not retain a reference after writing the result; refcounts are not atomic in this build). Direct `withThreadSignal` + `awaitSpawn` users that read `ctx[].result` bypass the constructor check and are responsible for the same guarantees themselves.
 
 Allowed:
 
 - `ptr` / `pointer` - plain values; the pointed-to data stays the caller's responsibility
 - non-capturing procs (`nimcall` and friends) - closures are forbidden
-- `{.acyclic.}` ref types - when the analysis proves the value unshared (fresh construction); otherwise via the `unsafeIsolate` escape hatch
+- `{.acyclic.}` ref types - when the analysis proves the value unshared (fresh construction)
 
-Forbidden: `ref` types (anonymous or named, unless `{.acyclic.}`), closures, closure iterators.
+Forbidden: non-acyclic (`cycle-tracked`) `ref` types, closures, closure iterators.
 
 ## Install
 

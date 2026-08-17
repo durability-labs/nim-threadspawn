@@ -19,6 +19,27 @@ type AcyclicBlock {.acyclic.} = ref object of RootObj
   cid: int
   data: seq[byte]
 
+type CyclicNode = ref object
+  next: CyclicNode
+
+type TaskErr = object
+  code: int
+  msg: string
+
+proc `$`(e: TaskErr): string =
+  e.msg
+
+static:
+  # The constructors run the compiler's Isolate check: cycle-tracked refs
+  # and closures must not compile as payloads; values, seqs, and void must.
+  doAssert not compiles(ThreadSpawnRes[CyclicNode].ok(CyclicNode()))
+  doAssert not compiles(
+    ThreadSpawnRes[proc() {.closure.}].ok(cast[proc() {.closure.}](nil))
+  )
+  doAssert compiles(ThreadSpawnRes[seq[byte]].ok(@[1'u8]))
+  doAssert compiles(ThreadSpawnRes[void].ok())
+  doAssert compiles(ThreadSpawnRes[void].err("boom"))
+
 proc toyWorker(task: ptr ToyTask) {.gcsafe.} =
   task[].ok.store(true)
   discard task[].signal.fireSync()
@@ -69,12 +90,11 @@ suite "threadspawn wrappers":
 
   test "spawnJoin extracts generic result":
     proc runIntTask(ctx: SharedPtr[TaskCtx[int]]) {.gcsafe.} =
-      var r = ThreadSpawnRes[int].ok(123)
-      ctx[].result = isolate(move r)
+      ctx[].result = ThreadSpawnRes[int].ok(123)
       discard ctx[].signal.fireSync()
 
     proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
-      let value = ?await spawnJoin[int](runIntTask)
+      let value = ?await spawnJoin(runIntTask)
       check value == 123
       success()
 
@@ -82,12 +102,11 @@ suite "threadspawn wrappers":
 
   test "spawnJoin with void result":
     proc runVoidTask(ctx: SharedPtr[TaskCtx[void]]) {.gcsafe.} =
-      var r = ThreadSpawnRes[void].ok()
-      ctx[].result = isolate(move r)
+      ctx[].result = ThreadSpawnRes[void].ok()
       discard ctx[].signal.fireSync()
 
     proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
-      let res = await spawnJoin[void](runVoidTask)
+      let res = await spawnJoin(runVoidTask)
       check res.isOk
       success()
 
@@ -95,12 +114,11 @@ suite "threadspawn wrappers":
 
   test "spawnJoin extracts error result":
     proc runErrTask(ctx: SharedPtr[TaskCtx[int]]) {.gcsafe.} =
-      var r = ThreadSpawnRes[int].err("boom")
-      ctx[].result = isolate(move r)
+      ctx[].result = ThreadSpawnRes[int].err("boom")
       discard ctx[].signal.fireSync()
 
     proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
-      let result = await spawnJoin[int](runErrTask)
+      let result = await spawnJoin(runErrTask)
       check result.isErr
       check result.error.msg == "boom"
       success()
@@ -109,34 +127,66 @@ suite "threadspawn wrappers":
 
   test "spawnJoin with seq result (move, not copy)":
     proc runSeqTask(ctx: SharedPtr[TaskCtx[seq[int]]]) {.gcsafe.} =
-      var r = ThreadSpawnRes[seq[int]].ok(@[1, 2, 3, 4, 5])
-      ctx[].result = isolate(move r)
+      ctx[].result = ThreadSpawnRes[seq[int]].ok(@[1, 2, 3, 4, 5])
       discard ctx[].signal.fireSync()
 
     proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
-      let value = ?await spawnJoin[seq[int]](runSeqTask)
+      let value = ?await spawnJoin(runSeqTask)
       check value == @[1, 2, 3, 4, 5]
       success()
 
     (await runTest()).tryGet()
 
   test "spawnJoin moves an acyclic ref payload":
-    # {.acyclic.} refs are never entered in ORC's per-thread cycle registry,
-    # so a worker-created ref crosses safely under unique ownership: the
-    # worker writes the result and never touches the payload again.  The
-    # inline construction lets the safe `isolate` prove the payload is
-    # unshared; moving a direct ref payload out of a variable would be
-    # rejected (the variable could be read again).
-    proc runAcycTask(ctx: SharedPtr[TaskCtx[AcyclicBlock]]) {.gcsafe.} =
-      ctx[].result = isolate(
-        ThreadSpawnRes[AcyclicBlock].ok(AcyclicBlock(cid: 7, data: @[1'u8, 2'u8, 3'u8]))
+    # The networkpeer Message shape: refs nested in a seq. The Isolate
+    # check cannot see through sequences, and the refs are {.acyclic.}
+    # (never registered in ORC's per-thread cycle registry), so the
+    # worker-created ref crosses safely under unique ownership: the
+    # constructor's Isolate check proves the value graph is fresh.
+    proc runAcycTask(ctx: SharedPtr[TaskCtx[seq[AcyclicBlock]]]) {.gcsafe.} =
+      ctx[].result = ThreadSpawnRes[seq[AcyclicBlock]].ok(
+        @[AcyclicBlock(cid: 7, data: @[1'u8, 2'u8, 3'u8])]
       )
       discard ctx[].signal.fireSync()
 
     proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
-      let value = ?await spawnJoin[AcyclicBlock](runAcycTask)
-      check value.cid == 7
-      check value.data == @[1'u8, 2'u8, 3'u8]
+      let value = ?await spawnJoin(runAcycTask)
+      check value.len == 1
+      check value[0].cid == 7
+      check value[0].data == @[1'u8, 2'u8, 3'u8]
+      success()
+
+    (await runTest()).tryGet()
+
+  test "spawnJoin with typed E and errMap":
+    proc runTypedErrTask(ctx: SharedPtr[TaskCtx[int, TaskErr]]) {.gcsafe.} =
+      ctx[].result =
+        ThreadSpawnRes[int, TaskErr].err(TaskErr(code: 42, msg: "typed boom"))
+      discard ctx[].signal.fireSync()
+
+    proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
+      let result = await spawnJoin(
+        runTypedErrTask,
+        errMap = proc(e: TaskErr): ref CatchableError =
+          newException(CatchableError, e.msg),
+      )
+      check result.isErr
+      check result.error.msg == "typed boom"
+      success()
+
+    (await runTest()).tryGet()
+
+  test "spawnJoin nil errMap falls back to SpawnFailure for non-string E":
+    proc runTypedErrTask(ctx: SharedPtr[TaskCtx[int, TaskErr]]) {.gcsafe.} =
+      ctx[].result =
+        ThreadSpawnRes[int, TaskErr].err(TaskErr(code: 7, msg: "fallback boom"))
+      discard ctx[].signal.fireSync()
+
+    proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
+      let result = await spawnJoin(runTypedErrTask)
+      check result.isErr
+      check result.error of SpawnFailure
+      check result.error.msg == "fallback boom"
       success()
 
     (await runTest()).tryGet()
