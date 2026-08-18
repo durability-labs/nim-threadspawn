@@ -64,7 +64,6 @@ import pkg/chronos/threadsync
 import pkg/chronicles
 import pkg/questionable/results
 import pkg/threading/smartptrs
-from pkg/results import ok, err
 
 export isolation except unsafeIsolate
 export threadsync
@@ -76,14 +75,6 @@ logScope:
 type
   SpawnFut* = Future[void].Raising([AsyncError, CancelledError])
     ## The future returned by ``ThreadSignalPtr.wait``.
-
-  OnSpawnError* = proc() {.async: (raises: []).}
-    ## Optional cleanup callback invoked when a spawned task fails or is
-    ## cancelled, before the noCancel drain.  Use it to flip ``finished``
-    ## flags or release resources the worker might be waiting on.
-    ##
-    ## Must not raise - a cancelled cleanup callback would hit Chronos'
-    ## ``noCancel`` ``raiseAssert`` and convert a cancellation into a Defect.
 
   ThreadSpawnRes*[T, E = string] = Isolated[Result[T, E]]
     ## Thread safe result type. Values are move-only (`=copy` is an error on
@@ -112,6 +103,40 @@ type
     signal*: ThreadSignalPtr
     result*: ThreadSpawnRes[T, E]
 
+  SpawnFailure* = object of CatchableError
+    ## Error type used when converting non-exception errors to ?!T.
+
+  SpawnError*[E = string] = object of CatchableError
+    ## Base error type of the spawn channel.  ``error`` holds the actual
+    ## error value untouched; being a ``CatchableError`` it composes with
+    ## ``?!T``-style error handling through the exception hierarchy.
+    error*: E
+
+  SpawnContractError* = object of CatchableError
+    ## Contract failure: signal creation, wait registration, drain errors.
+    ## Message-only.  Concrete (non-generic) so it can appear in ``raises``
+    ## annotations - the async macro rejects generic instantiations there.
+
+  SpawnUserError*[E = string] = ref SpawnError[E]
+    ## Worker error envelope: the worker's typed error ``E`` is preserved
+    ## in ``error``.  Never raised - carried in the result channel.
+
+  SpawnFn*[T, E = string] = proc(ctx: SharedPtr[TaskCtx[T, E]]) {.gcsafe, raises: [].}
+    ## Callback that receives the ctx and spawns the worker.
+    ## Must call ``tp.spawn worker(ctx, ...)`` inside.
+    ##
+    ## ``raises: []`` prevents a callback exception from unwinding ``spawnJoin``'s
+    ## signal-close defer while the queued worker still holds the signal.
+
+proc toSpawnError*[E](error: E): SpawnUserError[E] {.gcsafe, raises: [].} =
+  ## Envelope a worker error into the spawn channel error type.  The error
+  ## value is preserved in ``error``; ``msg`` mirrors it for logging.
+  when E is (ref Exception):
+    (ref SpawnError[E])(msg: error.msg, error: error)
+  else:
+    mixin `$`
+    (ref SpawnError[E])(msg: $error, error: error)
+
 proc ok*[T, E](R: type ThreadSpawnRes[T, E], value: sink T): R =
   ## Wrap a worker success value. Runs the `Isolate` payload check.
   isolate(Result[T, E].ok(move value))
@@ -127,9 +152,6 @@ proc err*[T, E](R: type ThreadSpawnRes[T, E], error: sink E): R =
 proc err*[E](R: type ThreadSpawnRes[void, E], error: sink E): R =
   ## Wrap a worker failure for a void task.
   isolate(Result[void, E].err(move error))
-
-type SpawnFailure* = object of CatchableError
-  ## Error type used when converting ThreadSpawnRes failures to ?!T.
 
 template mapThreadSpawnErr*[T, V](exp: Result[T, V]): ThreadSpawnRes[T, string] =
   ## Convert `Result[T, E]` to `ThreadSpawnRes[T, string]` at the worker
@@ -148,8 +170,24 @@ template mapThreadSpawnErr*[T, V](exp: Result[T, V]): ThreadSpawnRes[T, string] 
         $e
   )
 
+template mapThreadSpawnFailure*[T, V](
+    exp: Result[T, V]
+): Result[T, ref CatchableError] =
+  ## Convert `Result[T, E]` to a `ref CatchableError` result at the caller
+  ## boundary: exception errors pass through, everything else is wrapped in
+  ## `SpawnFailure`.
+
+  exp.mapErr(
+    proc(e: V): ref CatchableError =
+      when typeof(e) is (ref CatchableError):
+        (ref CatchableError)(e)
+      else:
+        mixin `$`
+        newException(SpawnFailure, $e)
+  )
+
 proc awaitSpawn*(
-    taskFut: SpawnFut, onError: OnSpawnError = nil
+    taskFut: SpawnFut
 ): Future[?!void] {.async: (raises: [CancelledError]).} =
   ## Cancellation-safe wait for a spawned task to complete.
   ##
@@ -159,32 +197,32 @@ proc awaitSpawn*(
   ## return, preventing use-after-free of heap-allocated task data.
   ##
   ## On cancellation: re-raises ``CancelledError`` after the worker finishes.
-  ## On other errors: optionally calls ``onError``, then returns the failure.
+  ## On contract errors (wait registration, drain): returns the failure
+  ## wrapped in ``SpawnFailure``.
   ##
   ## Signal lifecycle is NOT handled here - the caller (typically via
   ## ``withThreadSignal`` or ``spawnJoin``) owns ``signal.close`` via defer.
   ##
 
-  let joinFut = taskFut.join()
-
-  if err =? catch(await joinFut).errorOption:
-    if not onError.isNil:
-      await noCancel onError()
-
+  let joinRes = catch(await taskFut.join())
+  if joinErr =? joinRes.errorOption:
     # Must wait for worker to finish before returning - without this the
     # caller could free heap-allocated ctx/task while the worker is still
     # writing to it.
-    ?catch(await noCancel taskFut)
-    if err of CancelledError:
-      raise (ref CancelledError)(err)
-    return failure(err)
+    let drainRes = catch(await noCancel taskFut)
+    if drainErr =? drainRes.errorOption:
+      return failure(newException(SpawnFailure, drainErr.msg))
+    if joinErr of CancelledError:
+      raise (ref CancelledError)(joinErr)
+
+    return failure(newException(SpawnFailure, joinErr.msg))
 
   # join() completes unconditionally and does not forward the source future's
   # error.  If taskFut itself failed (e.g. register2/addReader2 in
   # ThreadSignalPtr.wait), return the error rather than reporting success
   # with an unwritten result.
   if taskFut.failed():
-    return failure(taskFut.error())
+    return failure(newException(SpawnFailure, taskFut.error().msg))
 
   success()
 
@@ -201,6 +239,8 @@ template withThreadSignal*(signalName, body: untyped) =
   ##
   ## ``signalName`` is caller-chosen so it cannot collide with existing variables.
   ##
+  ## On signal creation failure, raises ``SpawnContractError``.
+  ##
   ##   .. code-block:: nim
   ##      withThreadSignal(sig):
   ##        var task = MyTask(signal: sig, ...)
@@ -212,43 +252,40 @@ template withThreadSignal*(signalName, body: untyped) =
   ## so the signal fd is never leaked - even on cancellation.
   ##
   block:
-    let signalName {.inject.} =
-      ?ThreadSignalPtr.new().mapErr(
-        proc(e: string): ref CatchableError =
-          newException(SpawnFailure, e)
-      )
+    let signalRes = ThreadSignalPtr.new().mapThreadSpawnFailure
+    if sigErr =? signalRes.errorOption:
+      raise (ref SpawnContractError)(msg: sigErr.msg)
+    let signalName {.inject.} = signalRes.unsafeGet
+
     defer:
-      if closeErr =? signalName.close().errorOption:
-        warn "Failed to close thread signal", error = closeErr
+      let closeRes = signalName.close()
+      if closeRes.isErr:
+        warn "Failed to close thread signal", error = closeRes.error
+
     body
 
-type SpawnFn*[T, E = string] =
-  proc(ctx: SharedPtr[TaskCtx[T, E]]) {.gcsafe, raises: [].}
-  ## Callback that receives the ctx and spawns the worker.
-  ## Must call ``tp.spawn worker(ctx, ...)`` inside.
-  ##
-  ## ``raises: []`` prevents a callback exception from unwinding ``spawnJoin``'s
-  ## signal-close defer while the queued worker still holds the signal.
-
 proc spawnJoin*[T, E](
-    spawnFn: SpawnFn[T, E],
-    onError: OnSpawnError = nil,
-    errMap: proc(e: E): ref CatchableError {.gcsafe, raises: [].} = nil,
-): Future[?!T] {.async: (raises: [CancelledError]).} =
+    spawnFn: SpawnFn[T, E]
+): Future[Result[T, SpawnUserError[E]]] {.
+    async: (raises: [CancelledError, SpawnContractError])
+.} =
   ## Create a ``ThreadSignalPtr`` + ``SharedPtr[TaskCtx[T, E]]``, spawn the worker,
   ## await completion, close the signal, and extract the result.
+  ##
+  ## Returns the worker's extracted result; worker failures are enveloped
+  ## in ``SpawnUserError[E]`` (the typed error is preserved in ``error``),
+  ## which composes with ``?!T``-style handlers through the
+  ## ``CatchableError`` hierarchy.
+  ##
+  ## Contract failures (signal creation, wait registration, drain errors)
+  ## raise ``SpawnContractError``; cancellation propagates as
+  ## ``CancelledError``.
   ##
   ## ``spawnFn`` receives the ctx and must spawn the worker (e.g.
   ## ``tp.spawn worker(ctx, ...)``).  The callback runs on the calling thread
   ## before the first await, so any backend that can run a proc and fire a
   ## ``ThreadSignalPtr`` works.  Workers write results with:
   ## ``ctx[].result = ThreadSpawnRes[T].ok(...)``
-  ##
-  ## ``onError`` is invoked if the await fails or is cancelled, before the
-  ## noCancel drain (use it to flip ``finished`` flags etc).
-  ##
-  ## ``errMap`` converts the worker's typed error E to the ``?!T`` error type;
-  ## when nil, failures map to ``SpawnFailure`` via ``$e``.
   ##
   ## ``E`` is inferred from the worker's ctx type (e.g. ``TaskCtx[seq[Key]]``
   ## infers ``E = string``); for a typed error, pass it explicitly:
@@ -265,24 +302,20 @@ proc spawnJoin*[T, E](
   ##        proc(ctx: SharedPtr[TaskCtx[seq[Key]]]) {.gcsafe.} =
   ##          self.tp.spawn runHasTaskMany(ctx, paths)
 
-  let mapper =
-    if errMap.isNil:
-      (
-        proc(e: E): ref CatchableError {.gcsafe, raises: [].} =
-          newException(SpawnFailure, $e)
-      )
-    else:
-      errMap
-
   withThreadSignal(sig):
-    let ctx = newSharedPtr(TaskCtx[T, E](signal: sig))
-    let taskFut = sig.wait()
+    let
+      ctx = newSharedPtr(TaskCtx[T, E](signal: sig))
+      taskFut = sig.wait()
+
     if taskFut.failed():
-      return failure(taskFut.error())
+      raise (ref SpawnContractError)(msg: taskFut.error().msg)
+
     spawnFn(ctx)
-    ?await awaitSpawn(taskFut, onError)
-    when T is void:
-      ?extract(ctx[].result).mapErr(mapper)
-      success()
-    else:
-      success ?extract(ctx[].result).mapErr(mapper)
+    let awaited = await awaitSpawn(taskFut)
+    if awaitErr =? awaited.errorOption:
+      raise (ref SpawnContractError)(msg: awaitErr.msg)
+
+    extract(ctx[].result).mapErr(
+      proc(e: E): SpawnUserError[E] =
+        toSpawnError(e)
+    )

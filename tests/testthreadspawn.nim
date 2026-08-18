@@ -67,7 +67,9 @@ suite "threadspawn wrappers":
     tp.shutdown()
 
   test "withThreadSignal + awaitSpawn returns on success":
-    proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
+    proc runTest(): Future[?!void] {.
+        async: (raises: [CancelledError, SpawnContractError])
+    .} =
       withThreadSignal(sig):
         var task = ToyTask(value: 42, signal: sig)
         tp.spawn toyWorker(addr task)
@@ -78,7 +80,9 @@ suite "threadspawn wrappers":
     (await runTest()).tryGet()
 
   test "withThreadSignal + awaitSpawn propagates failure flag":
-    proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
+    proc runTest(): Future[?!void] {.
+        async: (raises: [CancelledError, SpawnContractError])
+    .} =
       withThreadSignal(sig):
         var task = ToyTask(value: 42, signal: sig)
         tp.spawn toyFailingWorker(addr task)
@@ -93,7 +97,9 @@ suite "threadspawn wrappers":
       ctx[].result = ThreadSpawnRes[int].ok(123)
       discard ctx[].signal.fireSync()
 
-    proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
+    proc runTest(): Future[?!void] {.
+        async: (raises: [CancelledError, SpawnContractError])
+    .} =
       let value = ?await spawnJoin(runIntTask)
       check value == 123
       success()
@@ -105,7 +111,9 @@ suite "threadspawn wrappers":
       ctx[].result = ThreadSpawnRes[void].ok()
       discard ctx[].signal.fireSync()
 
-    proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
+    proc runTest(): Future[?!void] {.
+        async: (raises: [CancelledError, SpawnContractError])
+    .} =
       let res = await spawnJoin(runVoidTask)
       check res.isOk
       success()
@@ -117,10 +125,14 @@ suite "threadspawn wrappers":
       ctx[].result = ThreadSpawnRes[int].err("boom")
       discard ctx[].signal.fireSync()
 
-    proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
-      let result = await spawnJoin(runErrTask)
-      check result.isErr
-      check result.error.msg == "boom"
+    proc runTest(): Future[?!void] {.
+        async: (raises: [CancelledError, SpawnContractError])
+    .} =
+      let res = await spawnJoin(runErrTask)
+      check res.isErr
+      check res.error of SpawnError[string]
+      check res.error.error == "boom"
+      check res.error.msg == "boom"
       success()
 
     (await runTest()).tryGet()
@@ -130,7 +142,9 @@ suite "threadspawn wrappers":
       ctx[].result = ThreadSpawnRes[seq[int]].ok(@[1, 2, 3, 4, 5])
       discard ctx[].signal.fireSync()
 
-    proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
+    proc runTest(): Future[?!void] {.
+        async: (raises: [CancelledError, SpawnContractError])
+    .} =
       let value = ?await spawnJoin(runSeqTask)
       check value == @[1, 2, 3, 4, 5]
       success()
@@ -149,7 +163,9 @@ suite "threadspawn wrappers":
       )
       discard ctx[].signal.fireSync()
 
-    proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
+    proc runTest(): Future[?!void] {.
+        async: (raises: [CancelledError, SpawnContractError])
+    .} =
       let value = ?await spawnJoin(runAcycTask)
       check value.len == 1
       check value[0].cid == 7
@@ -158,41 +174,28 @@ suite "threadspawn wrappers":
 
     (await runTest()).tryGet()
 
-  test "spawnJoin with typed E and errMap":
+  test "spawnJoin with typed E preserves the worker error payload":
     proc runTypedErrTask(ctx: SharedPtr[TaskCtx[int, TaskErr]]) {.gcsafe.} =
       ctx[].result =
         ThreadSpawnRes[int, TaskErr].err(TaskErr(code: 42, msg: "typed boom"))
       discard ctx[].signal.fireSync()
 
-    proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
-      let result = await spawnJoin(
-        runTypedErrTask,
-        errMap = proc(e: TaskErr): ref CatchableError =
-          newException(CatchableError, e.msg),
-      )
-      check result.isErr
-      check result.error.msg == "typed boom"
-      success()
-
-    (await runTest()).tryGet()
-
-  test "spawnJoin nil errMap falls back to SpawnFailure for non-string E":
-    proc runTypedErrTask(ctx: SharedPtr[TaskCtx[int, TaskErr]]) {.gcsafe.} =
-      ctx[].result =
-        ThreadSpawnRes[int, TaskErr].err(TaskErr(code: 7, msg: "fallback boom"))
-      discard ctx[].signal.fireSync()
-
-    proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
-      let result = await spawnJoin(runTypedErrTask)
-      check result.isErr
-      check result.error of SpawnFailure
-      check result.error.msg == "fallback boom"
+    proc runTest(): Future[?!void] {.
+        async: (raises: [CancelledError, SpawnContractError])
+    .} =
+      let res = await spawnJoin(runTypedErrTask)
+      check res.isErr
+      check res.error of SpawnError[TaskErr]
+      check res.error.error.code == 42
+      check res.error.error.msg == "typed boom"
       success()
 
     (await runTest()).tryGet()
 
   test "awaitSpawn cancellation drains worker before returning":
-    proc runTest(): Future[?!void] {.async: (raises: [CancelledError]).} =
+    proc runTest(): Future[?!void] {.
+        async: (raises: [CancelledError, SpawnContractError])
+    .} =
       withThreadSignal(sig):
         var task = ToyTask(value: 99, signal: sig)
         tp.spawn toySlowWorker(addr task)

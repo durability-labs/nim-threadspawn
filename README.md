@@ -14,10 +14,10 @@ Two pain points at the spawn/await boundary:
 ### `awaitSpawn` - lowest level
 
 ```nim
-proc awaitSpawn*(taskFut: SpawnFut, onError: OnSpawnError = nil): Future[?!void]
+proc awaitSpawn*(taskFut: SpawnFut): Future[?!void]
 ```
 
-Cancellation-safe wait on the future returned by `ThreadSignalPtr.wait`. Uses `join()` + `noCancel`: cancelling the caller does **not** cancel the worker - it runs to completion before returning, preventing use-after-free of heap-allocated task data. On cancellation, `CancelledError` is re-raised after the worker finishes. `onError` (must be `raises: []` - a raising cleanup would trip chronos' `noCancel` `raiseAssert`) runs before the drain. Signal lifecycle is the caller's responsibility.
+Cancellation-safe wait on the future returned by `ThreadSignalPtr.wait`. Uses `join()` + `noCancel`: cancelling the caller does **not** cancel the worker - it runs to completion before returning, preventing use-after-free of heap-allocated task data. On cancellation, `CancelledError` is re-raised after the worker finishes. Signal lifecycle is the caller's responsibility.
 
 ### `withThreadSignal` - raw signal management
 
@@ -32,14 +32,12 @@ Creates a `ThreadSignalPtr`, injects it as `signalName` (caller-chosen, no ident
 ```nim
 proc spawnJoin*[T, E](
     spawnFn: SpawnFn[T, E],
-    onError: OnSpawnError = nil,
-    errMap: proc(e: E): ref CatchableError {.gcsafe, raises: [].} = nil,
-): Future[?!T]
+): Future[Result[T, SpawnUserError[E]]] {.async: (raises: [CancelledError, SpawnContractError]).}
 
 type SpawnFn*[T, E = string] = proc(ctx: SharedPtr[TaskCtx[T, E]]) {.gcsafe, raises: [].}
 ```
 
-Encapsulates signal create/close, `SharedPtr[TaskCtx[T, E]]`, worker spawn, cancellation-safe await, and result extraction. The spawn callback must be `raises: []` (an exception after enqueuing would unwind the signal-close defer while the queued worker still holds the signal). Takes a spawn callback, not a `Taskpool`, so any backend that can run a proc and fire a `ThreadSignalPtr` works. `errMap` converts the worker's typed error `E` to the `?!T` error type; when nil, failures map to `SpawnFailure` via `$e`. `E` is inferred from the worker's ctx type (`TaskCtx[seq[Key]]` infers `E = string`); for a typed error, pass both explicitly: `spawnJoin[T, MyErr](...)`.
+Encapsulates signal create/close, `SharedPtr[TaskCtx[T, E]]`, worker spawn, cancellation-safe await, and result extraction. The spawn callback must be `raises: []` (an exception after enqueuing would unwind the signal-close defer while the queued worker still holds the signal). Takes a spawn callback, not a `Taskpool`, so any backend that can run a proc and fire a `ThreadSignalPtr` works. Returns the worker's extracted result: worker failures are enveloped in `SpawnUserError[E]` (the typed error is preserved in `error`) and, being a `CatchableError`, compose with `?!T`-style handlers via `?`. Contract failures (signal creation, wait registration, drain) raise `SpawnContractError`; cancellation propagates. `E` is inferred from the worker's ctx type (`TaskCtx[seq[Key]]` infers `E = string`); for a typed error, pass both explicitly: `spawnJoin[T, MyErr](...)`.
 
 ```nim
 let value = ?await spawnJoin:
@@ -54,7 +52,11 @@ Workers write results with `ctx[].result = ThreadSpawnRes[T].ok(...)` and fire t
 - `ThreadSpawnRes*[T, E = string] = Isolated[Result[T, E]]` - move-only; the payload and error are checked by the compiler's `Isolate` mechanism at construction.
 - `TaskCtx*[T, E = string]` - `signal` (`ThreadSignalPtr`) + `result` (`ThreadSpawnRes[T, E]`).
 - `mapThreadSpawnErr*[T, V](exp: Result[T, V]): ThreadSpawnRes[T, string]` - converts typed results at the worker boundary, isolating the result (message copied into an owned string).
-- `spawnJoin`'s `errMap` converts thread results to `?!T` at the async boundary; the default wraps failures in `SpawnFailure`.
+- `SpawnUserError*[E]` - worker error envelope (a `CatchableError`); the typed error is in `error`.
+- `SpawnContractError*` - infrastructure/contract failure (message-only), raised by `spawnJoin` and `withThreadSignal`
+- `mapThreadSpawnFailure*[T, V](exp: Result[T, V]): Result[T, ref CatchableError]` - caller-side bridge for non-exception errors (wrapped in `SpawnFailure`).
+
+The package depends on `questionable` (which re-exports `results`), `chronos`, `chronicles`, and `threading`.
 
 ## The GC-ref constraint
 
@@ -76,4 +78,4 @@ Forbidden: non-acyclic (`cycle-tracked`) `ref` types, closures, closure iterator
 nimble install https://github.com/durability-labs/threadspawn@#main
 ```
 
-Requires Nim >= 2.0.14, chronos 4.0.x, chronicles 0.12.x, questionable 0.10.x, taskpools >= 0.0.5, threading 0.2.x. Tests: `nimble test`.
+Requires Nim >= 2.0.14, chronos 4.0.x, chronicles 0.12.x, questionable 0.10.x, results, taskpools >= 0.0.5, threading 0.2.x. Tests: `nimble test`.

@@ -9,7 +9,8 @@ description = "Cancellation-safe primitives bridging taskpools thread spawn to C
 license = "Apache License 2.0 or MIT"
 
 requires "nim >= 2.0.14", "chronicles >= 0.12.0 & < 0.13.0",
-  "chronos >= 4.0.4 & < 4.1.0", "questionable >= 0.10.15 & < 0.11.0",
+  "chronos >= 4.0.4 & < 4.1.0",
+  "questionable >= 0.10.15 & < 0.11.0",
   "results", "taskpools >= 0.0.5", "threading >= 0.2.1 & < 0.3.0",
   "asynctest >= 0.5.2 & < 0.6.0", "unittest2 >= 0.2.3 & < 0.3.0",
   # chronicles pulls testutils unconstrained; 0.8.x fails to build
