@@ -54,7 +54,7 @@ Workers write results with `ctx[].result = ThreadSpawnRes[T].ok(...)` and fire t
 - `mapThreadSpawnErr*[T, V](exp: Result[T, V]): ThreadSpawnRes[T, string]` - converts typed results at the worker boundary, isolating the result (message copied into an owned string).
 - `SpawnUserError*[E]` - worker error envelope (a `CatchableError`); the typed error is in `error`.
 - `SpawnContractError*` - infrastructure/contract failure (message-only), raised by `spawnJoin` and `withThreadSignal`
-- `mapThreadSpawnFailure*[T, V](exp: Result[T, V]): Result[T, ref CatchableError]` - caller-side bridge for non-exception errors (wrapped in `SpawnFailure`).
+- `mapThreadSpawnFailure*[T, V](exp: Result[T, V]): Result[T, ref CatchableError]` - caller-side bridge for non-exception errors (wrapped in `SpawnError`).
 
 The package depends on `questionable` (which re-exports `results`), `chronos`, `chronicles`, and `threading`.
 
